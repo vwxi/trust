@@ -1,24 +1,36 @@
+use core::f64;
 use std::collections::BTreeMap;
+
+use std::fmt::Debug;
+use tracing::debug;
 
 type Vector<H> = BTreeMap<H, f64>;
 type Matrix<H> = BTreeMap<H, BTreeMap<H, f64>>;
 
-struct Trust<H: Clone + Copy + Ord + PartialOrd + Eq + PartialEq> {
+// a single trust computation
+struct Trust<H: Debug + Clone + Copy + Ord + PartialOrd + Eq + PartialEq> {
     // own id
     pub own_id: H,
     // list of pre-trusted peers
     pub pre_trusted_peers: Vec<H>,
     // "C" matrix, peer: { what peer thinks of other peers }
     pub global: Matrix<H>,
-    // initial local vector
+    // initial local vector applied with alpha
+    alpha_local: Vector<H>,
+    // local vector
     pub local: Vector<H>,
     // alpha value
     pub alpha: f64,
+    // delta
+    delta: f64,
+    // epsilon
+    epsilon: f64
 }
 
-impl<H: Clone + Copy + Ord + PartialOrd + Eq + PartialEq> Trust<H> {
+impl<H: Debug + Clone + Copy + Ord + PartialOrd + Eq + PartialEq> Trust<H> {
     pub fn new(id: H, alpha_: f64, ptp: Vec<H>) -> Self {
         let mut t: Vector<H> = Vector::new();
+        let mut t2: Vector<H> = Vector::new();
         let mut m: Matrix<H> = Matrix::new();
 
         // t(0) = p
@@ -26,6 +38,8 @@ impl<H: Clone + Copy + Ord + PartialOrd + Eq + PartialEq> Trust<H> {
         let inv_p = 1.0f64 / ptp.len() as f64;
         for p in ptp.clone() {
             t.entry(p).or_insert(inv_p);
+            t2.entry(p).or_insert(inv_p * alpha_);
+            
             m.entry(id)
                 .and_modify(|e| {
                     let _ = e.insert(p, inv_p);
@@ -42,18 +56,28 @@ impl<H: Clone + Copy + Ord + PartialOrd + Eq + PartialEq> Trust<H> {
         Trust {
             own_id: id,
             global: m,
-            local: t,
+            local: t.clone(),
+            alpha_local: t,
             pre_trusted_peers: ptp,
             alpha: alpha_,
+            delta: f64::MAX,
+            epsilon: 0.0001f64
         }
     }
 
-    // add trust value to global matrix
+    // add trust value to global matrix and maybe local trust vector
     pub fn add(&mut self, i: H, j: H, score: f64) -> bool {
         // only accept normalized scores
         if score > 1.0f64 || score < 0.0f64 {
             return false;
         }
+
+        if i == self.own_id {
+            debug!("adding to own entry: {:?} -> {:?} value {}", i, j, score);
+            self.local.entry(j).and_modify(|e| { *e = score; }).or_insert(score);
+        }
+
+        debug!("adding to global entry: {:?} -> {:?} value {}", i, j, score);
 
         self.global
             .entry(i)
@@ -93,23 +117,42 @@ impl<H: Clone + Copy + Ord + PartialOrd + Eq + PartialEq> Trust<H> {
         }
     }
 
-    pub(crate) fn dot_mat_vec(mat: &BTreeMap<H, Vector<H>>, vec: &Vector<H>) -> Vector<H> {
-        mat.iter()
-            .filter_map(|row| {
-                let sum = row.1
+    // t(k+1) = (1 − a)CT t(k) + ap 
+    pub fn iterate(&mut self) {
+        let tk1: Vector<H> = self.global.iter()
+            .filter_map(|(row_idx, row)| {
+                let sum = row
                     .iter()
-                    .filter_map(|(&idx, &global_score)| {
-                        vec.get(&idx).map(|local_score| global_score * local_score)
+                    .filter_map(|(&col_idx, _)| {
+                        self.local.get(&col_idx)
+                            .map(|local_score| dbg!(self.score(*row_idx, col_idx)) * dbg!(local_score))
                     })
-                    .sum::<f64>();
+                    .sum::<f64>() * (1.0f64 - self.alpha) + self.alpha_local.get(row_idx).or(Some(&0f64)).unwrap();
 
                 if sum != 0.0 {
-                    Some((*row.0, sum))
+                    Some((*row_idx, sum))
                 } else {
                     None
                 }
             })
-            .collect()
+            .collect();
+
+        self.delta = tk1.iter().filter_map(|(row_idx, row)| {
+            Some((row - self.local.get(row_idx).or(Some(&0f64)).unwrap_or(&0f64)).powf(2.0f64))
+        }).sum::<f64>().sqrt();
+
+        self.local.clear();
+        self.local = tk1;
+
+        debug!("current delta: {}, epsilon: {}", self.delta, self.epsilon);
+    }
+
+    pub fn run(&mut self) {
+        while self.delta > self.epsilon {
+            self.iterate();
+        }
+
+        dbg!(&self.local);
     }
 }
 
@@ -122,47 +165,25 @@ mod tests {
 
     #[traced_test]
     #[test]
-    fn dot_mat_vec() {
-        {
-            let matrix: Matrix<U256> = Matrix::from([
-                (
-                    U256::from(0),
-                    Vector::from([
-                        (U256::from(0), 1.0),
-                        (U256::from(1), 2.0),
-                        (U256::from(2), 3.0),
-                    ]),
-                ),
-                (
-                    U256::from(1),
-                    Vector::from([
-                        (U256::from(0), 4.0),
-                        (U256::from(1), 5.0),
-                        (U256::from(2), 6.0),
-                    ]),
-                ),
-                (
-                    U256::from(2),
-                    Vector::from([
-                        (U256::from(0), 7.0),
-                        (U256::from(1), 8.0),
-                        (U256::from(2), 9.0),
-                    ]),
-                ),
-            ]);
+    fn trust1() {
+        let mut trust: Trust<U256> = Trust::new(U256::from(1), 0.001, vec![]);
+        
+        // A
+        trust.add(U256::from(1), U256::from(2), 0.2);
+        trust.add(U256::from(1), U256::from(3), 0.3);
+        trust.add(U256::from(1), U256::from(4), 0.1);
 
-            let vector: Vector<U256> = Vector::from([
-                (U256::from(0), 1.0),
-                (U256::from(1), 0.5),
-                (U256::from(2), -1.0),
-            ]);
+        // B
+        trust.add(U256::from(2), U256::from(3), 0.2);
+        trust.add(U256::from(2), U256::from(4), 0.2);
 
-            let result = Trust::dot_mat_vec(&matrix, &vector);
+        // C
+        trust.add(U256::from(3), U256::from(1), 0.4);
 
-            assert!(result
-                .iter()
-                .zip([-1.0f64, 0.5f64, 2.0f64].iter())
-                .all(|(x, y)| x.1 == y));
-        }
+        // D
+        trust.add(U256::from(4), U256::from(2), 1.0);
+    
+        
+        trust.run();
     }
 }
