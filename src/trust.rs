@@ -9,20 +9,16 @@ type Matrix<H> = BTreeMap<H, BTreeMap<H, f64>>;
 
 // a single trust computation
 struct Trust<H: Debug + Default + Clone + Copy + Ord + PartialOrd + Eq + PartialEq> {
-    // own id
-    pub own_id: H,
-    // list of pre-trusted peers
-    pub pre_trusted_peers: Vec<H>,
     // "C" matrix, peer: { what peer thinks of other peers }
-    pub global: Matrix<H>,
+    global: Matrix<H>,
     // initial local vector
     initial: Vector<H>,
     // local vector
-    pub local: Vector<H>,
+    local: Vector<H>,
     // global max
     global_max: f64,
     // alpha value
-    pub alpha: f64,
+    alpha: f64,
     // delta
     delta: f64,
     // epsilon
@@ -61,11 +57,9 @@ impl<H: Debug + Default + Clone + Copy + Ord + PartialOrd + Eq + PartialEq> Trus
         }
 
         Trust {
-            own_id: id,
             global: m,
             local: t.clone(),
             initial: t,
-            pre_trusted_peers: ptp,
             global_max: 0f64,
             alpha: alpha_,
             delta: f64::MAX,
@@ -73,24 +67,12 @@ impl<H: Debug + Default + Clone + Copy + Ord + PartialOrd + Eq + PartialEq> Trus
         }
     }
 
-    // add trust value to global matrix and maybe local trust vector
+    // add trust value to global matrix
     pub fn add(&mut self, i: H, j: H, score: f64) -> bool {
         // only accept normalized scores
         if score > 1.0f64 || score < 0.0f64 {
             return false;
         }
-
-        if i == self.own_id {
-            debug!("adding to own entry: {:?} -> {:?} value {}", i, j, score);
-            self.local
-                .entry(j)
-                .and_modify(|e| {
-                    *e = score;
-                })
-                .or_insert(score);
-        }
-
-        debug!("adding to global entry: {:?} -> {:?} value {}", i, j, score);
 
         self.global
             .entry(i)
@@ -107,8 +89,6 @@ impl<H: Debug + Default + Clone + Copy + Ord + PartialOrd + Eq + PartialEq> Trus
 
         self.global_max = self.global.iter().fold(0f64, |a, e| e.1.iter().fold(0.0f64, |a, e| a.max(*e.1)).max(a));
         
-        debug!("global_max: {}", self.global_max);
-
         true
     }
 
@@ -123,7 +103,7 @@ impl<H: Debug + Default + Clone + Copy + Ord + PartialOrd + Eq + PartialEq> Trus
                 acc = tvs.get(j).unwrap_or(&0f64).max(0f64);
             }
 
-            dbg!(acc / self.global_max)
+            acc / self.global_max
         }
     }
 
@@ -135,9 +115,7 @@ impl<H: Debug + Default + Clone + Copy + Ord + PartialOrd + Eq + PartialEq> Trus
         for (i, trusters) in &self.global {
             for (j, trust_value) in trusters {
                 if i != j {
-                    let t = self.n_score(i, j) * dbg!(trust_value);
-                    debug!("computing trust from {:?} to {:?} : {}", i, j, t);
-
+                    let t = self.n_score(i, j) * trust_value;
                     tk1.entry(*j).and_modify(|e| { *e += t; }).or_insert(t);
                 }
             }
@@ -164,7 +142,7 @@ impl<H: Debug + Default + Clone + Copy + Ord + PartialOrd + Eq + PartialEq> Trus
             .sqrt();
 
         self.local.clear();
-        self.local = dbg!(tk1);
+        self.local = tk1;
 
         debug!("current delta: {}, epsilon: {}", self.delta, self.epsilon);
     }
@@ -173,8 +151,10 @@ impl<H: Debug + Default + Clone + Copy + Ord + PartialOrd + Eq + PartialEq> Trus
         while self.delta > self.epsilon {
             self.iterate();
         }
+    }
 
-        dbg!(&self.local);
+    pub fn get(&self, i: &H) -> f64 {
+        *self.local.get(i).unwrap_or(&0.0f64)
     }
 }
 
@@ -199,8 +179,51 @@ mod tests {
 
         trust.run();
 
+        debug!("{:?}", trust.local);
+
         assert_eq!(trust.local.get(&U256::from(1)).unwrap(), trust.local.get(&U256::from(2)).unwrap());
         assert_eq!(trust.local.get(&U256::from(2)).unwrap(), trust.local.get(&U256::from(3)).unwrap());
         assert_eq!(trust.local.get(&U256::from(1)).unwrap(), trust.local.get(&U256::from(3)).unwrap());
+    }
+
+    #[traced_test]
+    #[test]
+    fn low_trust() {
+        let mut trust: Trust<U256> = Trust::new(U256::from(1), 0.95, vec![]);
+
+        trust.add(U256::from(1), U256::from(2), 1.0f64);
+        trust.add(U256::from(1), U256::from(3), 0.1f64);
+        trust.add(U256::from(2), U256::from(1), 1.0f64);
+        trust.add(U256::from(2), U256::from(3), 0.1f64);
+        trust.add(U256::from(3), U256::from(1), 1.0f64);
+        trust.add(U256::from(3), U256::from(2), 1.0f64);
+
+        trust.run();
+
+        debug!("{:?}", trust.local);
+
+        assert!(trust.local.get(&U256::from(1)).unwrap() == trust.local.get(&U256::from(2)).unwrap());
+        assert!(trust.local.get(&U256::from(2)).unwrap() > trust.local.get(&U256::from(3)).unwrap());
+        assert!(trust.local.get(&U256::from(1)).unwrap() > trust.local.get(&U256::from(3)).unwrap());
+    }
+
+    #[traced_test]
+    #[test]
+    fn single_pre_trusted() {
+        let mut trust: Trust<U256> = Trust::new(U256::from(1), 0.95, vec![U256::from(1)]);
+
+        trust.add(U256::from(1), U256::from(2), rand::random());
+        trust.add(U256::from(1), U256::from(3), rand::random());
+        trust.add(U256::from(2), U256::from(1), rand::random());
+        trust.add(U256::from(2), U256::from(3), rand::random());
+        trust.add(U256::from(3), U256::from(1), rand::random());
+        trust.add(U256::from(3), U256::from(2), rand::random());
+
+        trust.run();
+
+        debug!("{:?}", trust.local);
+
+        assert!(trust.local.get(&U256::from(1)).unwrap() > trust.local.get(&U256::from(2)).unwrap());
+        assert!(trust.local.get(&U256::from(1)).unwrap() > trust.local.get(&U256::from(3)).unwrap());
     }
 }
